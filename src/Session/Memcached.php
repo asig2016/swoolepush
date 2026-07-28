@@ -26,6 +26,23 @@ class Memcached implements Backend
 	 */
 	protected static $memcached;
 	protected static $save_path;
+	/**
+	 * Timestamp of the last successful call to each backend, keyed by host_port
+	 *
+	 * @var int[]
+	 */
+	protected static $last_success = [];
+	/**
+	 * How long a single backend may stay unreachable before we give up and exit, to force
+	 * a restart (eg. by Kubernetes) and thus a guaranteed fresh reconnect / DNS resolution.
+	 *
+	 * A single dead backend, while others stay healthy, is NOT detected by the reconnect
+	 * logic below (that only triggers when ALL backends fail for the very same lookup), so
+	 * without this, sessions sharded onto the dead backend just keep silently failing as
+	 * "unknown session" forever, eg. after a Kubernetes node-rebuild that recreates the push
+	 * pod and the memcached pods in an unpredictable order.
+	 */
+	const BACKEND_DOWN_TIMEOUT = 60;
 
 	/**
 	 * Constructor
@@ -42,12 +59,27 @@ class Memcached implements Backend
 		{
 			foreach(explode(',', self::$save_path = $path ?? ini_get('session.save_path')) as $host_port)
 			{
+				// MemcachePool is a singleton for the whole worker process and has NO way to unregister
+				// a pool: registering the same $host_port a 2nd time (eg. on reconnect) always throws
+				// PoolException "is already been register", crashing the whole push-server uncaught!
+				// --> reuse the already registered pool instead of re-registering it
+				if (($pool = MemcachePool::getInstance()->getPool($host_port)))
+				{
+					self::$memcached[$host_port] = $pool->getConfig();
+					continue;
+				}
 				list ($host, $port) = explode(':', $host_port);
 				$config = new Config([
 					'host' => $host,
 					'port' => $port ?? 11211,
 				]);
 				self::$memcached[$host_port] = MemcachePool::getInstance()->register($config, $host_port);
+				// EasySwoole\Pool\Config defaults maxObjectNum to just 20, far too small for a burst
+				// of concurrent handshakes (eg. after a mass client reconnect): a burst exceeding it
+				// makes initObject() fail exactly like a real connection failure, up to triggering a
+				// reconnect --> raise it well above the expected concurrent push-client count
+				self::$memcached[$host_port]->setMaxObjectNum(256);
+				self::$last_success[$host_port] ??= time();
 			}
 		}
 	}
@@ -97,11 +129,23 @@ class Memcached implements Backend
 					return $memcache->get($key);
 				}, $host_port);
 				//var_dump("memcached->get('$key')=", $data);
+				self::$last_success[$host_port] = time();
 				if ($data !== null) break;
 			}
 			catch (\Exception $e) {
 				$exceptions[$host_port] = $e;
 				error_log(__METHOD__."('$key', $try_reconnect) ".$e->getMessage());
+				// this single backend might be down while others stay fine, in which case the
+				// "all backends failed" check below never triggers: without this, sessions
+				// sharded onto it would silently keep failing as "unknown session" forever
+				// --> force a restart once it's been down for too long
+				$down_for = time() - (self::$last_success[$host_port] ?? time());
+				if ($down_for > self::BACKEND_DOWN_TIMEOUT)
+				{
+					error_log(__METHOD__."('$key') FATAL: memcached backend '$host_port' unreachable for {$down_for}s (> ".
+						self::BACKEND_DOWN_TIMEOUT."s), last error: ".$e->getMessage().' --> exiting to force a restart/reconnect');
+					exit(1);
+				}
 				continue;
 			}
 		}
