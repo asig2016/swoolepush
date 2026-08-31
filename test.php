@@ -32,7 +32,28 @@ require_once __DIR__.'/../header.inc.php';
 
 if (PHP_SAPI !== 'cli')
 {
-	Api\Framework::message($message=lang('Checking PUSH (green for success or red for failure)'), 'error');
+	// Random per-request token, round-tripped through the actual push, so the client can tell a
+	// real push for THIS test apart from a stale one arriving late from a previous run - avoids
+	// assuming a fixed ordering between this synchronous response and the async push, which used
+	// to be safe (push always arrived after the response) but is no longer deterministic.
+	// pushTestStart() arms a client-side timeout, only showing the failure message if no
+	// matching-token push arrives within it - no separate "checking..." message, only ever one
+	// of the two final (success/failure) messages is shown, egw.message() replaces any prior one.
+	// Framework::set_extra() is for real (non-AJAX/JSON) requests like this one - it's embedded
+	// as a data-app-call attribute on egw's own script tag and executed by egw.js once the
+	// framework (incl. the app object) is ready, same mechanism as eg. Framework::message()'s
+	// data-message. Targets window.top explicitly (egw.js's data-app-call reader does too): this
+	// page (Admin > Test Push) is normally loaded inside an iframe within the admin app, and that
+	// iframe never instantiates its own app objects - only the top window does, which is also the
+	// only place the actual push WebSocket connection lives, matching where the push-delivered
+	// pushTestMessage() call always lands.
+	$push_test_token = bin2hex(random_bytes(8));
+	Api\Framework::set_extra('app', 'call', [
+		'app' => 'admin',
+		'method' => 'pushTestStart',
+		'args' => [$push_test_token, 2000, lang('Push server is NOT working')],
+	]);
+
 	echo $egw->framework->header();
 	echo "<pre>\n";
 	$success_start = "<span style='color: green; font-weight: bold'>";
@@ -81,10 +102,9 @@ try {
 
 	if (PHP_SAPI !== 'cli')
 	{
-		// success message needs to be delayed (3rd param) as push might be quicker than the error-message in the regular response
 		(new Backend())->addGeneric(Push::SESSION, 'apply', [
 			'func' => 'app.admin.pushTestMessage',
-			'parms' => [$message, 'info', 200],
+			'parms' => [$push_test_token, lang('Push server is working')],
 		]);
 	}
 }
