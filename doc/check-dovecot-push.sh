@@ -4,12 +4,14 @@
 #
 # Run as root on the host running Dovecot (and usually EGroupware + the push server):
 #
-#   bash check-dovecot-push.sh [imap-user e.g. user@example.org] [--simulate] [--push-url URL] [--token TOKEN]
+#   bash check-dovecot-push.sh [imap-user e.g. user@example.org] [--simulate] [--push-url URL] [--token TOKEN] [--push-container NAME]
 #
 # --simulate sends ONE fake "MessageNew" for the given imap-user to the push server, exactly like
 #            Dovecot's push_notification plugin does: the user sees a "New mail from push-test" toast
 #            in every browser logged into EGroupware. Nothing else is modified.
 # --push-url / --token override what is auto-detected from doveconf / the push container
+# --push-container names the push container to compare against, if several stacks run on this box
+#            (default: the one publishing the port of the Dovecot push URL, else the first found)
 #
 # Everything else is read-only. Docker containers are auto-detected (egroupware-docker setup),
 # native installations are handled too.
@@ -23,11 +25,13 @@ IMAP_USER=""
 SIMULATE=0
 PUSH_URL_OVERRIDE=""
 TOKEN_OVERRIDE=""
+PUSH_CONTAINER_OVERRIDE=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--simulate) SIMULATE=1;;
 		--push-url) shift; PUSH_URL_OVERRIDE="$1";;
 		--token) shift; TOKEN_OVERRIDE="$1";;
+		--push-container) shift; PUSH_CONTAINER_OVERRIDE="$1";;
 		-h|--help) sed -n '2,20p' "$0"; exit 0;;
 		*) IMAP_USER="$1";;
 	esac
@@ -57,19 +61,42 @@ DOCKER=0
 have docker && docker ps >/dev/null 2>&1 && DOCKER=1
 PUSH_CONTAINER=""; EGW_CONTAINER=""; DOVECOT_CONTAINER=""
 if [ $DOCKER = 1 ]; then
-	PUSH_CONTAINERS=$(docker ps --format '{{.Names}}' | grep -i push)
-	PUSH_CONTAINER=$(echo "$PUSH_CONTAINERS" | head -1)
-	if [ "$(echo "$PUSH_CONTAINERS" | wc -l)" -gt 1 ]; then
-		warn "several push containers running, using $PUSH_CONTAINER (pass --token to use another one):"
-		docker ps --format '{{.Names}}\t{{.Ports}}' | grep -i push | evidence
-	fi
-	EGW_CONTAINER=$(docker ps --format '{{.Names}}' | grep -iE '^(egroupware|.*egroupware)$' | grep -viE 'push|nginx|db|mail|phpmyadmin|collabora|rocket' | head -1)
 	# a container which has doveconf inside
 	for c in $(docker ps --format '{{.Names}}'); do
 		if docker exec "$c" sh -c 'command -v doveconf' >/dev/null 2>&1; then
 			DOVECOT_CONTAINER=$c; break
 		fi
 	done
+	PUSH_CONTAINERS=$(docker ps --format '{{.Names}}' | grep -i push)
+	PUSH_CONTAINER=$(echo "$PUSH_CONTAINERS" | head -1)
+	if [ -n "$PUSH_CONTAINER_OVERRIDE" ]; then
+		PUSH_CONTAINER=$PUSH_CONTAINER_OVERRIDE
+		info "using push container $PUSH_CONTAINER from --push-container"
+	elif [ "$(echo "$PUSH_CONTAINERS" | wc -l)" -gt 1 ]; then
+		# several stacks on this box: prefer the container publishing the port Dovecot's push URL points to
+		EARLY_URL=$PUSH_URL_OVERRIDE
+		if [ -z "$EARLY_URL" ]; then
+			if have doveconf; then EARLY_CONF=$(doveconf -P -n 2>/dev/null)
+			elif [ -n "$DOVECOT_CONTAINER" ]; then EARLY_CONF=$(docker exec "$DOVECOT_CONTAINER" doveconf -P -n 2>/dev/null)
+			else EARLY_CONF=""; fi
+			EARLY_URL=$(echo "$EARLY_CONF" | sed -n 's/^ *push_lua_url *= *//p' | head -1)
+			[ -z "$EARLY_URL" ] && EARLY_URL=$(echo "$EARLY_CONF" | sed -n 's/^ *push_notification_driver *= *ox:url=\([^ ]*\).*/\1/p' | head -1)
+		fi
+		EARLY_PORT=$(echo "$EARLY_URL" | sed -E 's#^[a-z]*://([^@/]*@)?##' | sed -nE 's#^[^/:]*:([0-9]+).*#\1#p')
+		BY_PORT=""
+		[ -n "$EARLY_PORT" ] && BY_PORT=$(docker ps --format '{{.Names}}\t{{.Ports}}' | grep -E ":$EARLY_PORT->" | cut -f1 | head -1)
+		if [ -n "$BY_PORT" ]; then
+			PUSH_CONTAINER=$BY_PORT
+			ok "several push containers running, using $PUSH_CONTAINER as it publishes port $EARLY_PORT of the Dovecot push URL"
+		else
+			warn "several push containers running, using $PUSH_CONTAINER (pass --push-container NAME to use another one):"
+		fi
+		docker ps --format '{{.Names}}\t{{.Ports}}' | grep -i push | evidence
+	fi
+	# the egroupware container of the same stack (same name prefix), else the first one
+	STACK=${PUSH_CONTAINER%%egroupware*}
+	EGW_CONTAINER=$(docker ps --format '{{.Names}}' | grep -iE "^${STACK}egroupware$" | head -1)
+	[ -z "$EGW_CONTAINER" ] && EGW_CONTAINER=$(docker ps --format '{{.Names}}' | grep -iE '^(egroupware|.*egroupware)$' | grep -viE 'push|nginx|db|mail|phpmyadmin|collabora|rocket' | head -1)
 	info "docker: push=${PUSH_CONTAINER:-none} egroupware=${EGW_CONTAINER:-none} dovecot=${DOVECOT_CONTAINER:-none}"
 else
 	info "docker not available or not running --> assuming native installation"
