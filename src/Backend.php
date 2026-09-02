@@ -60,6 +60,16 @@ class Backend extends Credentials implements Api\Json\PushBackend
 	}
 
 	/**
+	 * URL of the push server used by this backend
+	 *
+	 * @return string
+	 */
+	public function url()
+	{
+		return $this->url;
+	}
+
+	/**
 	 * Return or increment failed attempts
 	 *
 	 * If the failed attempts exceed MAX_FAILED_ATTEMPTS=3, we stop trying to talk to push server for
@@ -102,12 +112,12 @@ class Backend extends Credentials implements Api\Json\PushBackend
 		if ($double === false && $backoff_time > self::MIN_BACKOFF_TIME)
 		{
 			Api\Cache::setInstance(__CLASS__, 'backoff-time', $backoff_time = self::MIN_BACKOFF_TIME);
-			error_log(__METHOD__."($incr) reset backoff-time to $backoff_time seconds");
+			error_log(__METHOD__."(false) reset backoff-time to $backoff_time seconds");
 		}
 		elseif ($double)
 		{
 			if (($backoff_time *= 2) > self::MAX_BACKOFF_TIME) $backoff_time = self::MAX_BACKOFF_TIME;
-			error_log(__METHOD__."($incr) increased backoff-time to $backoff_time seconds");
+			error_log(__METHOD__."(true) increased backoff-time to $backoff_time seconds");
 			Api\Cache::setInstance(__CLASS__, 'backoff-time', $backoff_time);
 		}
 		return $backoff_time;
@@ -170,6 +180,39 @@ class Backend extends Credentials implements Api\Json\PushBackend
 	}
 
 	/**
+	 * Send a message to the push server the same way Dovecot's push_notification plugin does
+	 *
+	 * Used by test.php to check the IMAP push path (PUT + JSON body + Basic auth "Bearer:<token>")
+	 * without needing a real mail arriving on the IMAP server.
+	 *
+	 * @param array $data JSON payload like sent by doc/dovecot-push.lua, must contain "user" with the METADATA value
+	 * @param ?string &$status =null on return HTTP status line of the push server, or connection error
+	 * @return string|false response from push server "N subscribers notified" or false on error
+	 */
+	public function imapPush(array $data, ?string &$status=null)
+	{
+		$header = [];
+		$status = null;
+		if (($sock = self::http_open($this->url, 'PUT', json_encode($data), [
+				'Content-Type' => 'application/json; charset=utf-8',
+				// Dovecot can only do Basic auth, so we test exactly that
+				'Authorization' => 'Basic '.base64_encode('Bearer:'.self::getBearerToken()),
+			])) &&
+			($response = stream_get_contents($sock)) !== false &&
+			($body = self::parse_http_response($response, $header)) !== null && !empty($header[0]))
+		{
+			$status = $header[0];
+			if (substr($header[0], 9, 3)[0] == 2)
+			{
+				return trim($body);
+			}
+			return false;
+		}
+		$status = $sock ? 'no or invalid response from push server' : 'could not connect to push server '.$this->url;
+		return false;
+	}
+
+	/**
 	 * Get users online / connected to push-server
 	 *
 	 * @return array of integer account_id currently available for push
@@ -219,7 +262,8 @@ class Backend extends Credentials implements Api\Json\PushBackend
 		$request = $method.' '.$parts['path'].(empty($parts['query'])?'':'?'.$parts['query'])." HTTP/1.1\r\n".
 			"Host: ".$parts['host'].(empty($parts['port'])?'':':'.$parts['port'])."\r\n".
 			"User-Agent: swoolepush/src/Backend.php\r\n".
-			"Authorization: Bearer ".self::getBearerToken()."\r\n".
+			// allow to override the authorization, e.g. imapPush() using Basic auth like Dovecot
+			(isset($header['Authorization']) ? '' : "Authorization: Bearer ".self::getBearerToken()."\r\n").
 			"Accept: application/json\r\n".
 			"Cache-Control: no-cache\r\n".
 			"Pragma:no-cache\r\n".
