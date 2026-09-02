@@ -57,7 +57,12 @@ DOCKER=0
 have docker && docker ps >/dev/null 2>&1 && DOCKER=1
 PUSH_CONTAINER=""; EGW_CONTAINER=""; DOVECOT_CONTAINER=""
 if [ $DOCKER = 1 ]; then
-	PUSH_CONTAINER=$(docker ps --format '{{.Names}}' | grep -i push | head -1)
+	PUSH_CONTAINERS=$(docker ps --format '{{.Names}}' | grep -i push)
+	PUSH_CONTAINER=$(echo "$PUSH_CONTAINERS" | head -1)
+	if [ "$(echo "$PUSH_CONTAINERS" | wc -l)" -gt 1 ]; then
+		warn "several push containers running, using $PUSH_CONTAINER (pass --token to use another one):"
+		docker ps --format '{{.Names}}\t{{.Ports}}' | grep -i push | evidence
+	fi
 	EGW_CONTAINER=$(docker ps --format '{{.Names}}' | grep -iE '^(egroupware|.*egroupware)$' | grep -viE 'push|nginx|db|mail|phpmyadmin|collabora|rocket' | head -1)
 	# a container which has doveconf inside
 	for c in $(docker ps --format '{{.Names}}'); do
@@ -135,11 +140,12 @@ section "2. Dovecot version and push configuration"
 ########################################################################
 
 DOVE_VERSION=$(dove dovecot --version 2>/dev/null | awk '{print $1}')
-DOVE_CONF=$(dove doveconf -n 2>/dev/null)
+# -P is needed to show the token in push_lua_url, doveconf -n masks it as #hidden_use-P_to_show#
+DOVE_CONF=$(dove doveconf -P -n 2>/dev/null)
 if [ -z "$DOVE_CONF" ]; then
 	fail "doveconf -n returned nothing: cannot check the Dovecot configuration, run this script where Dovecot runs"
 else
-	echo "$DOVE_CONF" | grep -E 'mail_plugins|push_notification|push_lua|mail_attribute_dict|imap_metadata|mail_lua|^protocol|^plugin' | evidence
+	echo "$DOVE_CONF" | grep -E 'mail_plugins|push_notification|push_lua|mail_attribute_dict|imap_metadata|mail_lua|^protocol|^plugin' | sed 's#//Bearer:[^@]*@#//Bearer:***@#' | evidence
 fi
 # version comparison: 2.3.7 or newer supports lua + https + all events
 ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
@@ -191,7 +197,7 @@ case "$DRIVER" in
 		else
 			fail "lua script $LUA_FILE not found where Dovecot runs"
 		fi
-		if dove sh -c 'ls /usr/lib/dovecot/lib*_lua* /usr/lib64/dovecot/lib*_lua* 2>/dev/null' | grep -q lua; then
+		if dove sh -c 'ls /usr/lib/dovecot/modules/*lua* /usr/lib64/dovecot/modules/*lua* /usr/lib/dovecot/*lua* 2>/dev/null' | grep -q lua; then
 			ok "dovecot lua plugins installed"
 		else
 			fail "no dovecot lua plugin files found: install dovecot-lua"
@@ -242,6 +248,15 @@ if [ -n "$PUSH_URL" ]; then
 	else
 		fail "host $URL_HOST does not resolve where Dovecot runs (container DNS? add extra_hosts / --add-host)"
 	fi
+	URL_PORT=$(echo "$URL_NOAUTH" | sed -nE 's#^[a-z]*://[^/:]*:([0-9]+).*#\1#p')
+	if [ -n "$URL_PORT" ] && [ $DOCKER = 1 ]; then
+		BY_PORT=$(docker ps --format '{{.Names}}\t{{.Ports}}' | grep -E ":$URL_PORT->" | cut -f1 | head -1)
+		if [ -n "$BY_PORT" ] && [ "$BY_PORT" != "$PUSH_CONTAINER" ]; then
+			warn "port $URL_PORT of the Dovecot URL is published by container $BY_PORT, not by $PUSH_CONTAINER: its token is $(docker exec "$BY_PORT" cat /var/www/config.inc.php 2>/dev/null | sed -n "s/.*bearer_token *= *'\([^']*\)'.*/\1/p" | sed -E 's/^(....).*(..)$/\1...\2/')"
+		elif [ -n "$BY_PORT" ]; then
+			ok "port $URL_PORT is published by $PUSH_CONTAINER"
+		fi
+	fi
 	TESTTOKEN=${URL_TOKEN:-$PUSH_TOKEN}
 	RESP=$(dcurl -sS -i --connect-timeout 5 --max-time 10 -u "Bearer:$TESTTOKEN" "$URL_NOAUTH?token=x" 2>&1)
 	STATUS=$(echo "$RESP" | head -1 | tr -d '\r')
@@ -266,12 +281,11 @@ META=""
 if [ -z "$IMAP_USER" ]; then
 	warn "no imap-user given: pass the IMAP login (e.g. user@example.org) as first argument to check the registered push token"
 else
-	META=$(dove doveadm mailbox metadata get -u "$IMAP_USER" "" /private/vendor/vendor.dovecot/http-notify 2>&1)
-	rc=$?
-	if [ $rc != 0 ]; then
-		# older syntax needs -s / or the user does not exist
-		[ -n "$META" ] && echo "$META" | evidence
-		META2=$(dove doveadm mailbox metadata get -u "$IMAP_USER" -s "" /private/vendor/vendor.dovecot/http-notify 2>/dev/null) && META=$META2
+	# 2.3 wants -s for the server (empty mailbox) attribute, older versions the plain form
+	META=$(dove doveadm mailbox metadata get -u "$IMAP_USER" -s "" /private/vendor/vendor.dovecot/http-notify 2>&1)
+	if ! echo "$META" | grep -q '^user='; then
+		META2=$(dove doveadm mailbox metadata get -u "$IMAP_USER" "" /private/vendor/vendor.dovecot/http-notify 2>&1)
+		echo "$META2" | grep -q '^user=' && META=$META2
 	fi
 	if echo "$META" | grep -q '^user='; then
 		ok "METADATA /private/vendor/vendor.dovecot/http-notify for $IMAP_USER:"
