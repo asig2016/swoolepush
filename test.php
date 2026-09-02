@@ -4,7 +4,7 @@
  *
  * To use on commandline:
  * docker exec -it egroupware bash
- * HTTP_HOST=example.org php /usr/share/egroupware/swoolepush/test.php
+ * HTTP_HOST=example.org php /usr/share/egroupware/swoolepush/test.php [--all] [--simulate]
  *
  * Please note:
  * - backoff-time and failed-attempts are stored in APCu / shared memory and
@@ -30,6 +30,9 @@ use EGroupware\Api\Json\Push;
 use EGroupware\SwoolePush\Backend;
 use EGroupware\SwoolePush\Tokens;
 
+// timeout in seconds for IMAP connections in the test
+const IMAP_TIMEOUT = 5;
+
 $GLOBALS['egw_info'] = [
 	'flags' => [
 		'currentapp' => PHP_SAPI !== 'cli' ? 'admin' : 'login',
@@ -38,6 +41,10 @@ $GLOBALS['egw_info'] = [
 ];
 
 require_once __DIR__.'/../header.inc.php';
+
+// this is a diagnostic page for admins: show errors instead of a truncated page
+ini_set('display_errors', '1');
+error_reporting(E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED);
 
 if (PHP_SAPI !== 'cli')
 {
@@ -132,7 +139,7 @@ try {
 		echo "SwoolePush\Backend->addGeneric(session-token ".substr(Tokens::session(), 0, 8)."...)=".
 			push_result($subscribers > 0, $response === false ? lang('Push server not reachable or returned an error!') : trim($response)).
 			(!$subscribers && $response !== false ?
-				"\n".push_result(false, lang('Push server reachable, but NO websocket connection subscribed to this session: check the websocket proxy for %1 and the browser console!', Api\Framework::link('/push'))) : '').
+				"\n".push_result(false, lang('Push server reachable, but NO websocket connection subscribed to this session: push tokens rotate daily, so reload the browser first, then check the websocket proxy for %1 and the browser console!', Api\Framework::link('/push'))) : '').
 			"\n\n";
 	}
 }
@@ -147,11 +154,15 @@ echo "\n\nPush->online()=".json_encode(array_map(function($account_id) {
 },(new Push())->online()))."\n\n";
 
 /**
- * Check the IMAP push configuration for all mail accounts of the current user
+ * Check the IMAP push configuration for mail accounts of the current user
+ *
+ * By default only the default account is checked, as every account requires an IMAP connection
+ * (with a short timeout of IMAP_TIMEOUT seconds), which can take a while with many accounts.
  *
  * @param ?int $simulate_acc_id acc_id to send a simulated Dovecot push for
+ * @param bool $all_accounts false: check only the default account, true: all accounts of the user
  */
-function check_imap_push($simulate_acc_id=null)
+function check_imap_push($simulate_acc_id=null, $all_accounts=false)
 {
 	echo "\n".push_result(true, "IMAP push")."\n\n";
 
@@ -173,10 +184,31 @@ function check_imap_push($simulate_acc_id=null)
 		return;
 	}
 	$found = false;
-	foreach(Api\Mail\Account::search(true, 'acc_name') as $acc_id => $acc_name)
+	$default_acc_id = Api\Mail\Account::get_default_acc_id();
+	// search() returns an iterator
+	$accounts = iterator_to_array(Api\Mail\Account::search(true, 'acc_name'));
+	if (!$all_accounts)
+	{
+		$all = $accounts;
+		$accounts = $default_acc_id ? [$default_acc_id => $all[$default_acc_id] ?? "#$default_acc_id"] : [];
+		echo lang('Checking only the default mail account (%1 accounts in total).', count($all));
+		if (PHP_SAPI !== 'cli')
+		{
+			echo " <form style='display:inline-block; margin:0' method='post'><input type='submit' name='all_accounts' value='".lang('Check all mail accounts')."' style='padding: 5px'/></form>";
+		}
+		else
+		{
+			echo ' '.lang('Use --all to check all accounts.');
+		}
+		echo "\n\n";
+	}
+	// every account needs an IMAP connection, up to IMAP_TIMEOUT seconds each
+	@set_time_limit(30 + 2 * IMAP_TIMEOUT * count($accounts));
+	foreach($accounts as $acc_id => $acc_name)
 	{
 		$found = true;
 		echo "Account #$acc_id '".$acc_name."' ";
+		flush();	// show progress, if the webserver does not buffer
 		try {
 			// read() (unlike search()) also reads the credentials
 			$account = Api\Mail\Account::read($acc_id);
@@ -186,7 +218,7 @@ function check_imap_push($simulate_acc_id=null)
 				continue;
 			}
 			echo "IMAP ".$account->acc_imap_host.':'.$account->acc_imap_port.": ";
-			$imap = $account->imapServer();
+			$imap = $account->imapServer(false, IMAP_TIMEOUT);
 			if (!($imap instanceof Api\Mail\Imap\PushIface))
 			{
 				echo push_result(false, get_class($imap).' '.lang('does not support push'))."\n";
@@ -277,7 +309,8 @@ function check_imap_push($simulate_acc_id=null)
 	}
 }
 
-check_imap_push(!empty($_POST['simulate_imap']) ? (int)$_POST['acc_id'] : (PHP_SAPI === 'cli' && in_array('--simulate', $argv) ? Api\Mail\Account::get_default_acc_id() : null));
+check_imap_push(!empty($_POST['simulate_imap']) ? (int)$_POST['acc_id'] : (PHP_SAPI === 'cli' && in_array('--simulate', $argv) ? Api\Mail\Account::get_default_acc_id() : null),
+	!empty($_POST['all_accounts']) || PHP_SAPI === 'cli' && in_array('--all', $argv));
 
 if (PHP_SAPI !== 'cli')
 {
