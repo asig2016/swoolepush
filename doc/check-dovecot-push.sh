@@ -134,21 +134,26 @@ if [ -n "$TOKEN_OVERRIDE" ]; then
 	PUSH_TOKEN=$TOKEN_OVERRIDE
 	info "using bearer token from --token"
 else
+	PUSH_TOKEN_SRC=""
 	for f in /var/lib/egroupware-push/config.inc.php /var/lib/egroupware/push/config.inc.php /usr/share/egroupware/swoolepush/config.inc.php; do
-		[ -r "$f" ] && PUSH_TOKEN=$(sed -n "s/.*bearer_token *= *'\([^']*\)'.*/\1/p" "$f") && [ -n "$PUSH_TOKEN" ] && info "bearer token read from $f" && break
+		[ -r "$f" ] && PUSH_TOKEN=$(sed -n "s/.*bearer_token *= *'\([^']*\)'.*/\1/p" "$f") && [ -n "$PUSH_TOKEN" ] && PUSH_TOKEN_SRC="$f" && break
 	done
 	if [ -z "$PUSH_TOKEN" ] && [ -n "$PUSH_CONTAINER" ]; then
 		PUSH_TOKEN=$(docker exec "$PUSH_CONTAINER" cat /var/www/config.inc.php 2>/dev/null | sed -n "s/.*bearer_token *= *'\([^']*\)'.*/\1/p")
-		[ -n "$PUSH_TOKEN" ] && info "bearer token read from container $PUSH_CONTAINER:/var/www/config.inc.php"
+		[ -n "$PUSH_TOKEN" ] && PUSH_TOKEN_SRC="container $PUSH_CONTAINER:/var/www/config.inc.php"
 	fi
 	if [ -z "$PUSH_TOKEN" ] && [ $DOCKER = 1 ]; then
 		vol=$(docker volume ls -q | grep -i push-config | head -1)
 		[ -n "$vol" ] && PUSH_TOKEN=$(docker run --rm -v "$vol":/mnt:ro busybox cat /mnt/config.inc.php 2>/dev/null | sed -n "s/.*bearer_token *= *'\([^']*\)'.*/\1/p")
-		[ -n "$PUSH_TOKEN" ] && info "bearer token read from docker volume $vol"
+		[ -n "$PUSH_TOKEN" ] && PUSH_TOKEN_SRC="docker volume $vol"
 	fi
 fi
 if [ -n "$PUSH_TOKEN" ]; then
-	ok "push server bearer token: ${PUSH_TOKEN:0:4}...${PUSH_TOKEN: -2} (${#PUSH_TOKEN} chars)"
+	ok "push server bearer token: $PUSH_TOKEN (${#PUSH_TOKEN} chars) read from ${PUSH_TOKEN_SRC:---token}"
+	if [ -n "$PUSH_CONTAINER" ] && [ $DOCKER = 1 ]; then
+		info "mounts of $PUSH_CONTAINER (where /var/www/config.inc.php really lives on the host):"
+		docker inspect -f '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}' "$PUSH_CONTAINER" 2>/dev/null | grep -E '/var/www|egroupware-push' | evidence
+	fi
 	case "$PUSH_TOKEN" in *[+/]*) warn "bearer token contains + or / which breaks URLs: replace them in config.inc.php (see wiki) and restart push + egroupware";; esac
 else
 	fail "Could not find the push server bearer token (docker exec -it egroupware-push cat /var/www/config.inc.php), pass it with --token"
@@ -156,9 +161,19 @@ fi
 # the EGroupware side must use the same file/token
 EGW_TOKEN=""
 if [ -n "$EGW_CONTAINER" ]; then
-	EGW_TOKEN=$(docker exec "$EGW_CONTAINER" sh -c 'cat /usr/share/egroupware/swoolepush/config.inc.php 2>/dev/null || cat /var/www/egroupware/swoolepush/config.inc.php 2>/dev/null' | sed -n "s/.*bearer_token *= *'\([^']*\)'.*/\1/p")
+	# EGroupware reads <its swoolepush dir>/config.inc.php, show every candidate the container has
+	for f in /var/www/egroupware/swoolepush/config.inc.php /usr/share/egroupware/swoolepush/config.inc.php /var/lib/egroupware-push/config.inc.php; do
+		t=$(docker exec "$EGW_CONTAINER" sh -c "cat $f 2>/dev/null" | sed -n "s/.*bearer_token *= *'\([^']*\)'.*/\1/p")
+		if [ -n "$t" ]; then
+			real=$(docker exec "$EGW_CONTAINER" sh -c "readlink -f $f" 2>/dev/null)
+			info "$EGW_CONTAINER:$f${real:+ -> $real} = $t"
+			[ -z "$EGW_TOKEN" ] && EGW_TOKEN=$t
+		fi
+	done
 	if [ -n "$EGW_TOKEN" ] && [ -n "$PUSH_TOKEN" ]; then
-		[ "$EGW_TOKEN" = "$PUSH_TOKEN" ] && ok "EGroupware container uses the same bearer token" || fail "EGroupware container ($EGW_CONTAINER) uses a DIFFERENT bearer token than the push server: the push-config volume is not shared"
+		[ "$EGW_TOKEN" = "$PUSH_TOKEN" ] && ok "EGroupware container uses the same bearer token" || fail "EGroupware container ($EGW_CONTAINER) uses a DIFFERENT bearer token ($EGW_TOKEN) than the push server ($PUSH_TOKEN): both must read the same config.inc.php (shared push-config volume or the same source dir)"
+	elif [ -z "$EGW_TOKEN" ]; then
+		warn "no config.inc.php with a bearer token found in $EGW_CONTAINER"
 	fi
 fi
 
@@ -265,9 +280,9 @@ if [ -n "$PUSH_URL" ]; then
 	if [ -z "$URL_TOKEN" ]; then
 		fail "URL has no 'Bearer:<token>@' user-info part: the push server will answer 401"
 	elif [ -n "$PUSH_TOKEN" ] && [ "$URL_TOKEN" != "$PUSH_TOKEN" ]; then
-		fail "token in Dovecot URL (${URL_TOKEN:0:4}...) differs from the push server token (${PUSH_TOKEN:0:4}...)"
+		fail "token in Dovecot URL ($URL_TOKEN) differs from the push server token ($PUSH_TOKEN from ${PUSH_TOKEN_SRC:---token})"
 	else
-		ok "token in URL matches push server token"
+		ok "token in URL ($URL_TOKEN) matches push server token"
 	fi
 	case "$URL_NOAUTH" in */egroupware/push|*/push) ok "URL path ends with /push";; *) warn "URL path is not .../push: must be the same path the browser uses for its websocket (EGroupware base URL + /push)";; esac
 	if dove getent hosts "$URL_HOST" >/dev/null 2>&1 || dcurl -s -o /dev/null --connect-timeout 3 "$URL_NOAUTH" 2>/dev/null || [ "$URL_HOST" != "${URL_HOST#[0-9]}" ]; then
